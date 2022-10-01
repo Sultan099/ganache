@@ -21,12 +21,17 @@ const PRECOMPILED_ACCOUNT: Account = {
 
 const accountCache: Address[] = [];
 const makeAccount = (i: number): Address => {
-  if (accountCache[i]) return accountCache[i];
+  const idx = i - 1;
+  if (accountCache[idx]) return accountCache[idx];
 
   // 20 bytes, the first 19 are 0, the last byte is the address
   const buf = Buffer.allocUnsafe(20).fill(0, 0, 19);
   buf[19] = i;
-  return (accountCache[i] = { buf } as any);
+  const address = {
+    buf,
+    equals: (a: { buf: Buffer }) => buf.equals(a.buf)
+  } as any;
+  return (accountCache[idx] = address);
 };
 
 /**
@@ -48,9 +53,10 @@ export const activatePrecompiles = async (stateManager: StateManager) => {
  * Puts the precompile accounts into the warmed addresses
  * @param stateManager -
  */
-export const warmPrecompiles = async (stateManager: DefaultStateManager) => {
+export const warmPrecompiles = (stateManager: DefaultStateManager) => {
   for (let i = 1; i <= NUM_PRECOMPILES; i++) {
     const account = makeAccount(i);
     stateManager.addWarmedAddress(account.buf);
   }
+  return accountCache;
 };

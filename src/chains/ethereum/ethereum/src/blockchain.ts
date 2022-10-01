@@ -9,7 +9,6 @@ import {
   TraceDataFactory,
   TraceStorageMap,
   RuntimeError,
-  CallError,
   StorageKeys,
   StorageRangeAtResult,
   StorageRecords,
@@ -19,19 +18,15 @@ import {
   EthereumRawAccount,
   TraceTransactionResult
 } from "@ganache/ethereum-utils";
-import type { Address as EthereumJsAddress } from "ethereumjs-util";
 import type { InterpreterStep } from "@ethereumjs/vm/dist/evm/interpreter";
 import { decode } from "@ganache/rlp";
 import { BN, KECCAK256_RLP } from "ethereumjs-util";
 import Common from "@ethereumjs/common";
 import VM from "@ethereumjs/vm";
-import { EVMResult } from "@ethereumjs/vm/dist/evm/evm";
-import { VmError, ERROR } from "@ethereumjs/vm/dist/exceptions";
 import { EthereumInternalOptions, Hardfork } from "@ganache/ethereum-options";
 import {
   Quantity,
   Data,
-  BUFFER_EMPTY,
   BUFFER_32_ZERO,
   BUFFER_256_ZERO,
   findInsertPosition,
@@ -44,17 +39,11 @@ import TransactionManager from "./data-managers/transaction-manager";
 import { Fork } from "./forking/fork";
 import { Address } from "@ganache/ethereum-address";
 import {
-  calculateIntrinsicGas,
   InternalTransactionReceipt,
   VmTransaction,
   TypedTransaction
 } from "@ganache/ethereum-transaction";
 import { Block, RuntimeBlock, Snapshots } from "@ganache/ethereum-block";
-import {
-  SimulationTransaction,
-  applySimulationOverrides,
-  CallOverrides
-} from "./helpers/run-call";
 import { ForkStateManager } from "./forking/state-manager";
 import {
   DefaultStateManager,
@@ -63,7 +52,7 @@ import {
 import { GanacheTrie } from "./helpers/trie";
 import { ForkTrie } from "./forking/trie";
 import type { LevelUp } from "levelup";
-import { activatePrecompiles, warmPrecompiles } from "./helpers/precompiles";
+import { activatePrecompiles } from "./helpers/precompiles";
 import TransactionReceiptManager from "./data-managers/transaction-receipt-manager";
 import { BUFFER_ZERO } from "@ganache/utils";
 import {
@@ -75,7 +64,11 @@ import {
 } from "./provider-events";
 
 import mcl from "mcl-wasm";
-import { maybeGetLogs } from "@ganache/console.log";
+import { AccessList } from "@ganache/ethereum-transaction/src/access-lists";
+import SimulationHandler, {
+  CallOverrides,
+  SimulationTransaction
+} from "./helpers/simulation-handler";
 
 const mclInitPromise = mcl.init(mcl.BLS12_381).then(() => {
   mcl.setMapToMode(mcl.IRTF); // set the right map mode; otherwise mapToG2 will return wrong values.
@@ -287,11 +280,7 @@ export default class Blockchain extends Emittery<BlockchainTypedEvents> {
       }
 
       // create VM and listen to step events
-      this.vm = await this.createVmFromStateTrie(
-        this.trie,
-        options.chain.allowUnlimitedContractSize,
-        true
-      );
+      this.vm = await this.createVmFromStateTrie(this.trie, true);
 
       {
         // Grab current time once to be used in all references to "now", to avoid
@@ -648,11 +637,12 @@ export default class Blockchain extends Emittery<BlockchainTypedEvents> {
 
   createVmFromStateTrie = async (
     stateTrie: GanacheTrie | ForkTrie,
-    allowUnlimitedContractSize: boolean,
     activatePrecompile: boolean,
     common?: Common
   ) => {
     const blocks = this.blocks;
+    const allowUnlimitedContractSize =
+      this.#options.chain.allowUnlimitedContractSize;
     // ethereumjs vm doesn't use the callback style anymore
     const blockchain = {
       getBlock: async (number: BN) => {
@@ -1047,62 +1037,45 @@ export default class Blockchain extends Emittery<BlockchainTypedEvents> {
 
   public async simulateTransaction(
     transaction: SimulationTransaction,
-    parentBlock: Block,
+    simulationBlock: Block,
     overrides: CallOverrides
   ) {
-    let result: EVMResult;
-
-    const data = transaction.data;
-    let gasLimit = transaction.gas.toBigInt();
-    // subtract out the transaction's base fee from the gas limit before
-    // simulating the tx, because `runCall` doesn't account for raw gas costs.
-    const hasToAddress = transaction.to != null;
-    let to: EthereumJsAddress = null;
-    if (hasToAddress) {
-      const toBuf = transaction.to.toBuffer();
-      to = {
-        equals: (a: { buf: Buffer }) => toBuf.equals(a.buf),
-        buf: toBuf
-      } as any;
-    } else {
-      to = null;
-    }
-
+    const options = this.#options;
     const common = this.fallback
       ? this.fallback.getCommonForBlockNumber(
           this.common,
           BigInt(transaction.block.header.number.toString())
         )
       : this.common;
+    const simHandler = new SimulationHandler(this, common);
 
-    const gasLeft =
-      gasLimit - calculateIntrinsicGas(data, hasToAddress, common);
-
-    const transactionContext = {};
-    this.emit("ganache:vm:tx:before", {
-      context: transactionContext
+    // re-emit simulation events:
+    simHandler.on("ganache:vm:tx:before", event => {
+      this.emit("ganache:vm:tx:before", event);
+    });
+    simHandler.on("ganache:vm:tx:step", event => {
+      if (!this.#emitStepEvent) return;
+      this.emit("ganache:vm:tx:step", event);
+    });
+    simHandler.on("ganache:vm:tx:after", event => {
+      this.emit("ganache:vm:tx:after", event);
+    });
+    simHandler.on("ganache:vm:tx:console.log", event => {
+      options.logging.logger.log(...event.logs);
+      this.emit("ganache:vm:tx:console.log", event);
     });
 
-    if (gasLeft >= 0n) {
-      const stateTrie = this.trie.copy(false);
-      stateTrie.setContext(
-        parentBlock.header.stateRoot.toBuffer(),
-        null,
-        parentBlock.header.number
-      );
-      const options = this.#options;
+    await simHandler.initialize(simulationBlock, transaction, overrides);
 
-      const vm = await this.createVmFromStateTrie(
-        stateTrie,
-        options.chain.allowUnlimitedContractSize,
-        false, // precompiles have already been initialized in the stateTrie
-        common
-      );
+    const callResult = await simHandler.runCall();
+    const callResultValue = callResult.execResult.returnValue;
 
-      // take a checkpoint so the `runCall` never writes to the trie. We don't
-      // commit/revert later because this stateTrie is ephemeral anyway.
-      vm.stateManager.checkpoint();
+    return callResultValue === undefined
+      ? Data.Empty
+      : Data.from(callResultValue);
+  }
 
+<<<<<<< HEAD
       vm.on("step", (event: InterpreterStep) => {
         const logs = maybeGetLogs(event);
         if (logs) {
@@ -1178,6 +1151,21 @@ export default class Blockchain extends Emittery<BlockchainTypedEvents> {
     } else {
       return Data.from(result.execResult.returnValue || "0x");
     }
+=======
+  public async createAccessList(
+    transaction: SimulationTransaction,
+    simulationBlock: Block
+  ): Promise<{ accessList: AccessList; gasUsed: string }> {
+    const common = this.fallback
+      ? this.fallback.getCommonForBlockNumber(
+          this.common,
+          BigInt(transaction.block.header.number.toString())
+        )
+      : this.common;
+    const simHandler = new SimulationHandler(this, common);
+    await simHandler.initialize(simulationBlock, transaction);
+    return await simHandler.createAccessList(transaction.accessList);
+>>>>>>> origin/access-list-validation
   }
 
   #traceTransaction = async (

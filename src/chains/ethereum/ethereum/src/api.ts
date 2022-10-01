@@ -46,6 +46,12 @@ import { Address } from "@ganache/ethereum-address";
 import { GanacheRawBlock } from "@ganache/ethereum-block";
 import { Capacity } from "./miner/miner";
 import { Ethereum } from "./api-types";
+import {
+  AccessList,
+  AccessLists
+} from "@ganache/ethereum-transaction/src/access-lists";
+import Common from "@ethereumjs/common";
+import { SimulationTransaction } from "./helpers/simulation-handler";
 
 async function autofillDefaultTransactionValues(
   tx: TypedTransaction,
@@ -83,6 +89,116 @@ async function autofillDefaultTransactionValues(
   }
 }
 
+function createSimulatedTransaction(
+  blockchain: Blockchain,
+  options: EthereumInternalOptions,
+  common: Common,
+  transaction: Ethereum.Transaction,
+  simulationBlock: Block
+): SimulationTransaction {
+  const simulationBlockHeader = simulationBlock.header;
+
+  let gas: Quantity;
+  if (typeof transaction.gasLimit === "undefined") {
+    if (typeof transaction.gas !== "undefined") {
+      gas = Quantity.from(transaction.gas);
+    } else {
+      // eth_call isn't subject to regular transaction gas limits by default
+      gas = options.miner.callGasLimit;
+    }
+  } else {
+    gas = Quantity.from(transaction.gasLimit);
+  }
+
+  let data: Data;
+  if (typeof transaction.data === "undefined") {
+    if (typeof transaction.input !== "undefined") {
+      data = Data.from(transaction.input);
+    }
+  } else {
+    data = Data.from(transaction.data);
+  }
+
+  // eth_call doesn't validate that the transaction has a sufficient
+  // "effectiveGasPrice". however, if `maxPriorityFeePerGas` or
+  // `maxFeePerGas` values are set, the baseFeePerGas is used to calculate
+  // the effectiveGasPrice, which is used to calculate tx costs/refunds.
+  const baseFeePerGasBigInt =
+    simulationBlockHeader.baseFeePerGas !== undefined
+      ? simulationBlockHeader.baseFeePerGas.toBigInt()
+      : undefined;
+
+  let gasPrice: Quantity;
+  const hasGasPrice = typeof transaction.gasPrice !== "undefined";
+  // if the original block didn't have a `baseFeePerGas` (baseFeePerGasBigInt
+  // is undefined) then EIP-1559 was not active on that block and we can't use
+  // type 2 fee values (as they rely on the baseFee)
+  if (!common.isActivatedEIP(1559) || baseFeePerGasBigInt === undefined) {
+    gasPrice = hasGasPrice
+      ? Quantity.Zero
+      : Quantity.from(transaction.gasPrice);
+  } else {
+    const hasMaxFeePerGas = typeof transaction.maxFeePerGas !== "undefined";
+    const hasMaxPriorityFeePerGas =
+      typeof transaction.maxPriorityFeePerGas !== "undefined";
+
+    if (hasGasPrice && (hasMaxFeePerGas || hasMaxPriorityFeePerGas)) {
+      throw new Error(
+        "both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified"
+      );
+    }
+    // User specified 1559 gas fields (or none), use those
+    let maxFeePerGas = 0n;
+    let maxPriorityFeePerGas = 0n;
+    if (hasMaxFeePerGas) {
+      maxFeePerGas = BigInt(transaction.maxFeePerGas);
+    }
+    if (hasMaxPriorityFeePerGas) {
+      maxPriorityFeePerGas = BigInt(transaction.maxPriorityFeePerGas);
+    }
+    if (maxPriorityFeePerGas > 0 || maxFeePerGas > 0) {
+      const maybeTip = maxFeePerGas - baseFeePerGasBigInt;
+      const tip =
+        maybeTip < maxPriorityFeePerGas ? maybeTip : maxPriorityFeePerGas;
+      gasPrice = Quantity.from(baseFeePerGasBigInt + tip);
+    } else {
+      gasPrice = Quantity.from(0);
+    }
+  }
+
+  // if EIP 2930 is activated and they provided an invalid access list,
+  // don't use it
+  if (common.isActivatedEIP(2930) && transaction.accessList) {
+    AccessLists.validateAccessList(transaction.accessList);
+  }
+
+  const block = new RuntimeBlock(
+    simulationBlockHeader.number,
+    simulationBlockHeader.parentHash,
+    blockchain.coinbase,
+    gas.toBuffer(),
+    simulationBlockHeader.gasUsed.toBuffer(),
+    simulationBlockHeader.timestamp,
+    options.miner.difficulty,
+    simulationBlockHeader.totalDifficulty,
+    baseFeePerGasBigInt
+  );
+
+  return {
+    gas,
+    // if we don't have a from address, our caller must be the configured coinbase address
+    from:
+      transaction.from == null
+        ? blockchain.coinbase
+        : Address.from(transaction.from),
+    to: transaction.to == null ? null : Address.from(transaction.to),
+    gasPrice,
+    value: transaction.value == null ? null : Quantity.from(transaction.value),
+    data,
+    block,
+    accessList: transaction.accessList
+  };
+}
 const version = process.env.VERSION || "DEV";
 //#endregion
 
@@ -2728,6 +2844,56 @@ export default class EthereumApi implements Api {
   }
 
   /**
+   * Creates an `accessList` based of the given transaction.
+   *
+   * Transaction call object:
+   * * `from`: `DATA`, 20 bytes (optional) - The address the transaction is sent from.
+   * * `to`: `DATA`, 20 bytes - The address the transaction is sent to.
+   * * `gas`: `QUANTITY` (optional) - Integer of the maximum gas allowance for the transaction.
+   * * `gasPrice`: `QUANTITY` (optional) - Integer of the price of gas in wei.
+   * * `value`: `QUANTITY` (optional) - Integer of the value in wei.
+   * * `data`: `DATA` (optional) - Hash of the method signature and the ABI encoded parameters.
+   *
+   * @param transaction - The transaction call object as seen in source.
+   * @param blockNumber - Integer block number, or the string "latest", "earliest"
+   *  or "pending".
+   *
+   * @returns An array of addresses and storage keys used by the transaction, plus an estimate
+   * of the gas consumed by the running the transaction _with_ the generated access list included.
+   * @example
+   * ```javascript
+   * const [from, to] = await provider.request({ method: "eth_accounts", params: [] });
+   * const txObj = { from, to };
+   * const result = await provider.request({ method: "eth_createAccessList", params: [txObj, "latest"] });
+   * console.log(result);
+   * ```
+   */
+  @assertArgLength(1, 3)
+  async eth_createAccessList(
+    transaction: Ethereum.Transaction,
+    blockNumber: QUANTITY | Tag = Tag.latest
+  ): Promise<{ accessList: AccessList; gasUsed: string }> {
+    const blockchain = this.#blockchain;
+    const common = blockchain.common;
+    const blocks = blockchain.blocks;
+    const simulationBlock = await blocks.get(blockNumber);
+
+    const simulatedTransaction = createSimulatedTransaction(
+      blockchain,
+      this.#options,
+      common,
+      transaction,
+      simulationBlock
+    );
+
+    const { accessList, gasUsed } = await blockchain.createAccessList(
+      simulatedTransaction,
+      simulationBlock
+    );
+    return { accessList, gasUsed };
+  }
+
+  /**
    * Executes a new message call immediately without creating a transaction on the block chain.
    *
    * Transaction call object:
@@ -2783,104 +2949,19 @@ export default class EthereumApi implements Api {
     const blockchain = this.#blockchain;
     const common = blockchain.common;
     const blocks = blockchain.blocks;
-    const parentBlock = await blocks.get(blockNumber);
-    const parentHeader = parentBlock.header;
-    const options = this.#options;
+    const simulationBlock = await blocks.get(blockNumber);
 
-    let gas: Quantity;
-    if (typeof transaction.gasLimit === "undefined") {
-      if (typeof transaction.gas !== "undefined") {
-        gas = Quantity.from(transaction.gas);
-      } else {
-        // eth_call isn't subject to regular transaction gas limits by default
-        gas = options.miner.callGasLimit;
-      }
-    } else {
-      gas = Quantity.from(transaction.gasLimit);
-    }
-
-    let data: Data;
-    if (typeof transaction.data === "undefined") {
-      if (typeof transaction.input !== "undefined") {
-        data = Data.from(transaction.input);
-      }
-    } else {
-      data = Data.from(transaction.data);
-    }
-
-    // eth_call doesn't validate that the transaction has a sufficient
-    // "effectiveGasPrice". however, if `maxPriorityFeePerGas` or
-    // `maxFeePerGas` values are set, the baseFeePerGas is used to calculate
-    // the effectiveGasPrice, which is used to calculate tx costs/refunds.
-    const baseFeePerGasBigInt = parentBlock.header.baseFeePerGas
-      ? parentBlock.header.baseFeePerGas.toBigInt()
-      : undefined;
-
-    let gasPrice: Quantity;
-    const hasGasPrice = typeof transaction.gasPrice !== "undefined";
-    // if the original block didn't have a `baseFeePerGas` (baseFeePerGasBigInt
-    // is undefined) then EIP-1559 was not active on that block and we can't use
-    // type 2 fee values (as they rely on the baseFee)
-    if (!common.isActivatedEIP(1559) || baseFeePerGasBigInt === undefined) {
-      gasPrice = Quantity.from(hasGasPrice ? 0 : transaction.gasPrice);
-    } else {
-      const hasMaxFeePerGas = typeof transaction.maxFeePerGas !== "undefined";
-      const hasMaxPriorityFeePerGas =
-        typeof transaction.maxPriorityFeePerGas !== "undefined";
-
-      if (hasGasPrice && (hasMaxFeePerGas || hasMaxPriorityFeePerGas)) {
-        throw new Error(
-          "both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified"
-        );
-      }
-      // User specified 1559 gas fields (or none), use those
-      let maxFeePerGas = 0n;
-      let maxPriorityFeePerGas = 0n;
-      if (hasMaxFeePerGas) {
-        maxFeePerGas = BigInt(transaction.maxFeePerGas);
-      }
-      if (hasMaxPriorityFeePerGas) {
-        maxPriorityFeePerGas = BigInt(transaction.maxPriorityFeePerGas);
-      }
-      if (maxPriorityFeePerGas > 0 || maxFeePerGas > 0) {
-        const a = maxFeePerGas - baseFeePerGasBigInt;
-        const tip = a < maxPriorityFeePerGas ? a : maxPriorityFeePerGas;
-        gasPrice = Quantity.from(baseFeePerGasBigInt + tip);
-      } else {
-        gasPrice = Quantity.from(0);
-      }
-    }
-
-    const block = new RuntimeBlock(
-      parentHeader.number,
-      parentHeader.parentHash,
-      blockchain.coinbase,
-      gas.toBuffer(),
-      parentHeader.gasUsed.toBuffer(),
-      parentHeader.timestamp,
-      options.miner.difficulty,
-      parentHeader.totalDifficulty,
-      baseFeePerGasBigInt
+    const simulatedTransaction = createSimulatedTransaction(
+      blockchain,
+      this.#options,
+      common,
+      transaction,
+      simulationBlock
     );
-
-    const simulatedTransaction = {
-      gas,
-      // if we don't have a from address, our caller sut be the configured coinbase address
-      from:
-        transaction.from == null
-          ? blockchain.coinbase
-          : Address.from(transaction.from),
-      to: transaction.to == null ? null : Address.from(transaction.to),
-      gasPrice,
-      value:
-        transaction.value == null ? null : Quantity.from(transaction.value),
-      data,
-      block
-    };
 
     return blockchain.simulateTransaction(
       simulatedTransaction,
-      parentBlock,
+      simulationBlock,
       overrides
     );
   }

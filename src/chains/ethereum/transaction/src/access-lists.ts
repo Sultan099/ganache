@@ -80,4 +80,74 @@ export class AccessLists {
       dataFeeEIP2930: dataFee
     };
   }
+
+  /**
+   * Validates a transaction's access list. Throws if:
+   * 1. the access list is not an array.
+   * 2. each access list item does not have the required `address` and `storageKeys` properties.
+   * 3. each `address` is not a 20-byte prefixed hex string.
+   * 4. each `storageKeys` is not an array containing only 32-byte prefixed hex string.
+   * @param accessList Access list to validate.
+   */
+  public static validateAccessList(accessList: AccessList) {
+    if (!Array.isArray(accessList)) {
+      throw new Error("access list must be an array");
+    }
+    for (const accessListItem of accessList) {
+      const { address, storageKeys } = accessListItem;
+      if (address === undefined) {
+        throw new Error("access list item must have an address property");
+      }
+      if (storageKeys === undefined) {
+        throw new Error("access list item must have a storageKeys property");
+      }
+
+      Address.validAddress(address);
+
+      if (!Array.isArray(storageKeys)) {
+        throw new Error(
+          `access list item's storageKeys property must be an array of storage keys`
+        );
+      }
+      for (const storageKey of storageKeys) {
+        Data.validateHexString(storageKey, 32); // storage keys have to be 32 bytes
+      }
+    }
+  }
+
+  /**
+   * Compares two access lists to check if they are the same, both in content
+   * and the order of the content.
+   * @param a An access list to compare.
+   * @param b An access list to compare.
+   * @returns Boolean indicating if the two access lists are the same.
+   */
+  public static areAccessListsSame(a: AccessList, b: AccessList) {
+    if (!a || !b) {
+      return false;
+    }
+    if (a.length !== b.length) {
+      return false;
+    }
+
+    for (let i = 0; i < a.length; i++) {
+      const alItemA = a[i];
+      const alItemB = b[i];
+      if (alItemA.address !== alItemB.address) {
+        return false;
+      }
+
+      const aKeys = alItemA.storageKeys;
+      const bKeys = alItemB.storageKeys;
+      if (aKeys.length !== bKeys.length) {
+        return false;
+      }
+      for (let j = 0; j < aKeys.length; j++) {
+        if (aKeys[j] !== bKeys[j]) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
 }
